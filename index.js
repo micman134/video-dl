@@ -6,13 +6,6 @@ const path = require('path');
 const crypto = require('crypto');
 const paywall = require('./paywall');
 
-require('http')
-  .createServer((req, res) => {
-    res.writeHead(200, { 'Content-Type': 'text/plain' });
-    res.end('ok');
-  })
-  .listen(process.env.PORT || 3000, () => console.log('Health server on', process.env.PORT || 3000));
-
 // Optional: on-video captions (npm i @napi-rs/canvas)
 let canvasLib = null;
 try {
@@ -60,17 +53,6 @@ const CLIP_MIN_VIDEO_SEC = 90; // only offer clipping for videos longer than thi
 // Caption feature
 const CAPTION_MAX_CHARS = 120;
 const POS_LABEL = { top: '⬆️ Top', mid: '⏺ Middle', bot: '⬇️ Bottom' };
-
-// Zoom feature (crop into the picture, then scale back to the original frame size)
-const ZOOM_LEVELS = [1.25, 1.5, 2, 3];
-const ZOOM_DEFAULT = 1.5;
-const ZOOM_FOCUS = {
-  c: { fx: 0.5, fy: 0.5, label: '⏺ Center' },
-  t: { fx: 0.5, fy: 0, label: '⬆️ Top' },
-  b: { fx: 0.5, fy: 1, label: '⬇️ Bottom' },
-  l: { fx: 0, fy: 0.5, label: '⬅️ Left' },
-  r: { fx: 1, fy: 0.5, label: '➡️ Right' },
-};
 
 if (!BOT_TOKEN) {
   console.error('Missing BOT_TOKEN in .env');
@@ -504,78 +486,6 @@ async function probeSize(file) {
   return { w: Number(m[1]) - (Number(m[1]) % 2), h: Number(m[2]) - (Number(m[2]) % 2) };
 }
 
-// ---------- Zoom ----------
-const zoomLabel = (z) => `${z.level}×  ·  ${ZOOM_FOCUS[z.focus].label}`;
-
-// The crop rectangle (in source pixels) for a zoom setting
-function zoomCrop(z, W, H) {
-  const f = ZOOM_FOCUS[z.focus];
-  const w = Math.max(2, Math.floor(W / z.level / 2) * 2);
-  const h = Math.max(2, Math.floor(H / z.level / 2) * 2);
-  return { x: Math.round((W - w) * f.fx), y: Math.round((H - h) * f.fy), w, h };
-}
-
-// ffmpeg filter: crop into the picture, then scale back so the output keeps the original size
-function zoomFilter(z, W, H) {
-  const c = zoomCrop(z, W, H);
-  return `crop=${c.w}:${c.h}:${c.x}:${c.y},scale=${W}:${H}:flags=lanczos,setsar=1`;
-}
-
-// Side-by-side preview on the video thumbnail: original (with the crop area marked) vs zoomed result (+ caption)
-async function renderZoomPreview(thumbUrl, zoom, overlay) {
-  if (!canvasLib) throw new Error('@napi-rs/canvas is not installed');
-  const data =
-    typeof fetch === 'function' ? Buffer.from(await (await fetch(thumbUrl)).arrayBuffer()) : thumbUrl;
-  const img = await canvasLib.loadImage(data);
-
-  const PW = 560; // panel width
-  const PH = Math.round((PW * img.height) / img.width);
-  const GAP = 24;
-  const TOP = 64;
-  const W = PW * 2 + GAP * 3;
-  const H = PH + TOP + GAP;
-  const canvas = canvasLib.createCanvas(W, H);
-  const ctx = canvas.getContext('2d');
-  ctx.fillStyle = '#111827';
-  ctx.fillRect(0, 0, W, H);
-
-  const xo = GAP; // original panel
-  const xz = GAP * 2 + PW; // zoomed panel
-  const y = TOP;
-
-  ctx.fillStyle = '#e5e7eb';
-  ctx.font = `bold 26px ${TEXT_FONT}`;
-  ctx.textBaseline = 'middle';
-  ctx.textAlign = 'left';
-  ctx.fillText('Original', xo, TOP / 2);
-  ctx.fillText(`Zoom ${zoom.level}×`, xz, TOP / 2);
-
-  // original + dimmed outside of the crop area
-  ctx.drawImage(img, xo, y, PW, PH);
-  const c = zoomCrop(zoom, img.width, img.height);
-  const k = PW / img.width;
-  const rx = xo + c.x * k;
-  const ry = y + c.y * k;
-  const rw = c.w * k;
-  const rh = c.h * k;
-  ctx.fillStyle = 'rgba(0,0,0,0.55)';
-  ctx.fillRect(xo, y, PW, ry - y); // above
-  ctx.fillRect(xo, ry + rh, PW, y + PH - (ry + rh)); // below
-  ctx.fillRect(xo, ry, rx - xo, rh); // left
-  ctx.fillRect(rx + rw, ry, xo + PW - (rx + rw), rh); // right
-  ctx.strokeStyle = '#facc15';
-  ctx.lineWidth = 3;
-  ctx.strokeRect(rx, ry, rw, rh);
-
-  // zoomed result
-  ctx.drawImage(img, c.x, c.y, c.w, c.h, xz, y, PW, PH);
-  if (overlay) {
-    const cap = await canvasLib.loadImage(renderCaption(overlay, PW, PH));
-    ctx.drawImage(cap, xz, y, PW, PH);
-  }
-  return canvas.toBuffer('image/png');
-}
-
 // ---------- Highlight detection (for clips) ----------
 
 // Per-second loudness (RMS dB) of the whole file, via ffmpeg
@@ -660,31 +570,24 @@ async function probeDuration(file) {
   return parseFloat(out) || 0;
 }
 
-// Blurred-background 9:16 canvas (TikTok / Reels / Shorts); `inp` is the label of the input video stream
-const verticalBase = (inp) =>
-  `${inp}split=2[a][b];` +
+// Blurred-background 9:16 canvas (TikTok / Reels / Shorts)
+const VERTICAL_BASE =
+  '[0:v]split=2[a][b];' +
   '[a]scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280,boxblur=25:3[bg];' +
   '[b]scale=720:-2[fg];' +
   '[bg][fg]overlay=(W-w)/2:(H-h)/2[base]';
 
 // capPng: optional full-frame transparent PNG (same size as the output) with the caption already drawn on it
-// zoom + srcDim: optional zoom setting and the source video size (needed to scale back after cropping)
-function buildClipArgs(src, start, len, fmt, out, capPng, zoom, srcDim) {
+function buildClipArgs(src, start, len, fmt, out, capPng) {
   const args = ['-hide_banner', '-loglevel', 'error', '-y', '-ss', String(start), '-i', src];
   if (capPng) args.push('-i', capPng);
   args.push('-t', String(len));
 
-  const zoomed = Boolean(zoom && srcDim);
-  const zf = zoomed ? `[0:v]${zoomFilter(zoom, srcDim.w, srcDim.h)}[z];` : '';
-  const vin = zoomed ? '[z]' : '[0:v]';
-
   let fc = null;
   if (fmt === 'v') {
-    fc = zf + verticalBase(vin) + (capPng ? ';[base][1:v]overlay=0:0,format=yuv420p[v]' : ';[base]format=yuv420p[v]');
+    fc = VERTICAL_BASE + (capPng ? ';[base][1:v]overlay=0:0,format=yuv420p[v]' : ';[base]format=yuv420p[v]');
   } else if (capPng) {
-    fc = `${zf}${vin}[1:v]overlay=0:0,format=yuv420p[v]`;
-  } else if (zoomed) {
-    fc = `${zf}[z]format=yuv420p[v]`;
+    fc = '[0:v][1:v]overlay=0:0,format=yuv420p[v]';
   }
   if (fc) args.push('-filter_complex', fc, '-map', '[v]', '-map', '0:a?');
   else args.push('-map', '0:v:0', '-map', '0:a?', '-pix_fmt', 'yuv420p');
@@ -711,7 +614,7 @@ const bar = (step, total = 4) => '▰'.repeat(step) + '▱'.repeat(total - step)
 
 // ---------- Sessions (callback_data is limited to 64 bytes, so we keep URLs server-side) ----------
 // id -> { id, url, userId, title, uploader, meta, videos, hidden, bestAudioSize, canClip, canCaption,
-//         overlay: {text,pos}|null, zoom: {level,focus}|null, thumb, header, caption, markup, duration, heatmap, expires }
+//         overlay: {text,pos}|null, header, caption, markup, duration, heatmap, expires }
 const sessions = new Map();
 setInterval(() => {
   const now = Date.now();
@@ -786,11 +689,6 @@ function buildCard(s) {
       ),
     ]);
   }
-  if (s.canZoom) {
-    rows.push([
-      Markup.button.callback(s.zoom ? `🔍 Zoom: ${zoomLabel(s.zoom)}` : '🔍 Zoom in (crop closer)', `zoom:${id}`),
-    ]);
-  }
   rows.push([
     Markup.button.url('🔗 Original', s.url),
     Markup.button.callback('💎 Plans', 'open_plans'),
@@ -801,7 +699,6 @@ function buildCard(s) {
   if (s.uploader) caption += `\n👤 ${escHtml(s.uploader.slice(0, 80))}`;
   if (s.meta.length) caption += `\n${s.meta.join('  •  ')}`;
   if (s.overlay) caption += `\n📝 <i>${escHtml(clip(s.overlay.text, 60))}</i>`;
-  if (s.zoom) caption += `\n🔍 <i>Zoom ${zoomLabel(s.zoom)}</i>`;
   caption += '\n\n👇 <b>Choose a quality</b>';
   if (s.hidden) {
     caption += `\n<i>${plural(s.hidden, 'higher option')} hidden (over the ${MAX_UPLOAD_MB}MB Telegram limit).</i>`;
@@ -835,34 +732,6 @@ function captionMenu(s) {
   return { text, markup };
 }
 
-// The zoom settings screen
-function zoomMenu(s) {
-  const id = s.id;
-  const cur = s.zoom ? `<b>${zoomLabel(s.zoom)}</b>` : '<i>off</i>';
-  const text =
-    `${s.header}\n\n` +
-    '🔍 <b>Zoom in</b>\n' +
-    `Current: ${cur}\n\n` +
-    'Crops closer into the picture and scales it back to full size. ' +
-    'Applies to downloaded videos and clips (not MP3).\n' +
-    '1️⃣ Pick how far to zoom\n2️⃣ Pick which part of the frame to keep\n' +
-    (s.thumb ? '3️⃣ Tap <b>Preview</b> to check it before downloading' : '');
-  const lvlBtn = (l) =>
-    Markup.button.callback((s.zoom && s.zoom.level === l ? '✅ ' : '') + `${l}×`, `zl:${id}:${Math.round(l * 100)}`);
-  const focBtn = (k) =>
-    Markup.button.callback((s.zoom && s.zoom.focus === k ? '✅ ' : '') + ZOOM_FOCUS[k].label, `zf:${id}:${k}`);
-  const rows = [
-    ZOOM_LEVELS.map(lvlBtn),
-    [focBtn('t'), focBtn('c'), focBtn('b')],
-    [focBtn('l'), focBtn('r')],
-  ];
-  const last = [];
-  if (s.thumb && canvasLib) last.push(Markup.button.callback('👁 Preview', `zprev:${id}`));
-  last.push(Markup.button.callback('🗑 Remove', `zoff:${id}`));
-  rows.push(last, [Markup.button.callback('⬅️ Back', `back:${id}`)]);
-  return { text, markup: Markup.inlineKeyboard(rows).reply_markup };
-}
-
 // Re-dispatch "/plans" so the paywall module's own handler runs (used by menu + inline buttons)
 function openPlans(ctx) {
   const base = ctx.message || ctx.callbackQuery.message;
@@ -885,8 +754,7 @@ const WELCOME = () =>
   '👋 <b>Welcome to the Video Downloader!</b>\n\n' +
   'Paste a <b>YouTube</b> or <b>TikTok</b> link and I\'ll show you a preview with the available qualities.\n\n' +
   '✂️ <b>Clips:</b> on longer videos I can auto-cut the best moments into ready-to-post clips.\n' +
-  '📝 <b>Captions:</b> add your own text + emojis on top of the video.\n' +
-  '🔍 <b>Zoom:</b> crop closer into the picture, with a preview.\n\n' +
+  '📝 <b>Captions:</b> add your own text + emojis on top of the video.\n\n' +
   `🆓 <b>Free plan:</b> ${paywall.FREE_DAILY_LIMIT} downloads per day\n` +
   '💎 <b>Premium:</b> unlimited downloads\n\n' +
   '<i>Only download content you have the right to save.</i>';
@@ -895,7 +763,7 @@ const HOW_TO =
   '📥 <b>How to download</b>\n\n' +
   '1️⃣ Copy a YouTube or TikTok link\n' +
   '2️⃣ Paste it here in the chat\n' +
-  '3️⃣ Optional: tap <b>📝 Add caption</b> to put your text + emojis on the video, or <b>🔍 Zoom in</b> to crop closer (with a preview)\n' +
+  '3️⃣ Optional: tap <b>📝 Add caption</b> to put your text + emojis on the video\n' +
   '4️⃣ Pick a quality (🎬 video or 🎵 MP3)\n' +
   '5️⃣ Wait a few seconds and receive your file\n\n' +
   `📦 Max file size: <b>${MAX_UPLOAD_MB}MB</b> • ⏱ Max length: <b>${MAX_DURATION_MIN} min</b>`;
@@ -1074,10 +942,7 @@ bot.on('text', async (ctx) => {
       bestAudioSize,
       canClip: Boolean(info.duration && info.duration >= CLIP_MIN_VIDEO_SEC) && ff,
       canCaption: Boolean(canvasLib) && ff,
-      canZoom: ff,
       overlay: null,
-      zoom: null,
-      thumb: pickThumbnail(info),
       duration: info.duration || undefined,
       heatmap: Array.isArray(info.heatmap) && info.heatmap.length ? info.heatmap : null,
       expires: Date.now() + 15 * 60 * 1000,
@@ -1234,75 +1099,6 @@ bot.action(/^capprev:([a-f0-9]+)$/, async (ctx) => {
   }
 });
 
-// ---------- Zoom settings ----------
-bot.action(/^zoom:([a-f0-9]+)$/, async (ctx) => {
-  const s = await getOwnedSession(ctx, ctx.match[1]);
-  if (!s) return;
-  await ctx.answerCbQuery();
-  pending.delete(ctx.from.id);
-  s.expires = Date.now() + 30 * 60 * 1000;
-  const m = zoomMenu(s);
-  await makeEditor(ctx)(m.text, m.markup);
-});
-
-bot.action(/^zl:([a-f0-9]+):(\d+)$/, async (ctx) => {
-  const s = await getOwnedSession(ctx, ctx.match[1]);
-  if (!s) return;
-  const level = Number(ctx.match[2]) / 100;
-  if (!ZOOM_LEVELS.includes(level)) return ctx.answerCbQuery('Invalid zoom level.', { show_alert: true });
-  await ctx.answerCbQuery(`Zoom ${level}×`);
-  s.zoom = { level, focus: (s.zoom && s.zoom.focus) || 'c' };
-  refreshCard(s);
-  logEvent(ctx.from, 'zoom_set', { chatId: ctx.chat.id, url: s.url, title: s.title, details: { ...s.zoom } });
-  const m = zoomMenu(s);
-  await makeEditor(ctx)(m.text, m.markup);
-});
-
-bot.action(/^zf:([a-f0-9]+):([tcblr])$/, async (ctx) => {
-  const s = await getOwnedSession(ctx, ctx.match[1]);
-  if (!s) return;
-  const focus = ctx.match[2];
-  await ctx.answerCbQuery(ZOOM_FOCUS[focus].label);
-  s.zoom = { level: (s.zoom && s.zoom.level) || ZOOM_DEFAULT, focus };
-  refreshCard(s);
-  const m = zoomMenu(s);
-  await makeEditor(ctx)(m.text, m.markup);
-});
-
-bot.action(/^zoff:([a-f0-9]+)$/, async (ctx) => {
-  const s = await getOwnedSession(ctx, ctx.match[1]);
-  if (!s) return;
-  s.zoom = null;
-  refreshCard(s);
-  logEvent(ctx.from, 'zoom_removed', { chatId: ctx.chat.id, url: s.url, title: s.title });
-  await ctx.answerCbQuery('Zoom removed');
-  const m = zoomMenu(s);
-  await makeEditor(ctx)(m.text, m.markup);
-});
-
-bot.action(/^zprev:([a-f0-9]+)$/, async (ctx) => {
-  const s = await getOwnedSession(ctx, ctx.match[1]);
-  if (!s) return;
-  if (!s.zoom) return ctx.answerCbQuery('Pick a zoom level first.', { show_alert: true });
-  if (!s.thumb) return ctx.answerCbQuery('No thumbnail available for a preview.', { show_alert: true });
-  await ctx.answerCbQuery('Rendering preview…');
-  try {
-    const png = await renderZoomPreview(s.thumb, s.zoom, s.overlay);
-    await ctx.replyWithPhoto(
-      { source: png },
-      {
-        caption:
-          `👁 <b>Zoom preview</b> · ${zoomLabel(s.zoom)}\n` +
-          '<i>Yellow box = the part that is kept. Based on the video thumbnail.</i>',
-        parse_mode: 'HTML',
-      }
-    );
-  } catch (e) {
-    console.error('Zoom preview error:', e.message);
-    await ctx.reply('❌ Could not render the zoom preview.');
-  }
-});
-
 // ---------- Download handler ----------
 bot.action(/^dl:([a-f0-9]+):(\w+)$/, async (ctx) => {
   const [, id, choice] = ctx.match;
@@ -1338,7 +1134,6 @@ bot.action(/^dl:([a-f0-9]+):(\w+)$/, async (ctx) => {
   const prefix = `${id}_${choice}`;
   const outTemplate = path.join(TMP_DIR, `${prefix}.%(ext)s`);
   const wantsCaption = choice !== 'audio' && Boolean(session.overlay);
-  const wantsZoom = choice !== 'audio' && Boolean(session.zoom);
   const logBase = { chatId, url: session.url, title: session.title, choice };
 
   try {
@@ -1365,42 +1160,31 @@ bot.action(/^dl:([a-f0-9]+):(\w+)$/, async (ctx) => {
     await run(args);
 
     await edit(
-      `${session.header}\n\n${
-        wantsCaption || wantsZoom
-          ? `🖍 <b>${wantsZoom ? 'Zooming in' : 'Adding your caption'}${wantsZoom && wantsCaption ? ' + caption' : ''}…</b>`
-          : '⚙️ <b>Processing…</b>'
-      }\n▰▰▱  Step 2 of 3`
+      `${session.header}\n\n${wantsCaption ? '🖍 <b>Adding your caption…</b>' : '⚙️ <b>Processing…</b>'}\n▰▰▱  Step 2 of 3`
     );
 
     const file = fs.readdirSync(TMP_DIR).find((f) => f.startsWith(prefix + '.'));
     if (!file) throw new Error('Output file not found (possibly over the size limit)');
     let filePath = path.join(TMP_DIR, file);
 
-    // Apply zoom and/or burn the caption into the video (one re-encode)
-    if (wantsCaption || wantsZoom) {
+    // Burn the caption into the video (re-encode)
+    if (wantsCaption) {
       try {
         const dim = await probeSize(filePath);
+        const capPng = path.join(TMP_DIR, `${prefix}.cap.png`);
         const capOut = path.join(TMP_DIR, `${prefix}.cap.mp4`);
-        const inputs = ['-i', filePath];
-        let fc;
-        const zf = wantsZoom ? `[0:v]${zoomFilter(session.zoom, dim.w, dim.h)}[z];` : '';
-        const vin = wantsZoom ? '[z]' : '[0:v]';
-        if (wantsCaption) {
-          const capPng = path.join(TMP_DIR, `${prefix}.cap.png`);
-          fs.writeFileSync(capPng, renderCaption(session.overlay, dim.w, dim.h));
-          inputs.push('-i', capPng);
-          fc = `${zf}${vin}[1:v]overlay=0:0,format=yuv420p[v]`;
-        } else {
-          fc = `${zf}${vin}format=yuv420p[v]`;
-        }
+        fs.writeFileSync(capPng, renderCaption(session.overlay, dim.w, dim.h));
         await runBin(FFMPEG, [
           '-hide_banner',
           '-loglevel',
           'error',
           '-y',
-          ...inputs,
+          '-i',
+          filePath,
+          '-i',
+          capPng,
           '-filter_complex',
-          fc,
+          '[0:v][1:v]overlay=0:0,format=yuv420p[v]',
           '-map',
           '[v]',
           '-map',
@@ -1421,7 +1205,7 @@ bot.action(/^dl:([a-f0-9]+):(\w+)$/, async (ctx) => {
         ]);
         filePath = capOut;
       } catch (e) {
-        e.captionFailed = true; // also used when the zoom step fails
+        e.captionFailed = true;
         throw e;
       }
     }
@@ -1477,7 +1261,7 @@ bot.action(/^dl:([a-f0-9]+):(\w+)$/, async (ctx) => {
     logEvent(ctx.from, 'download_done', {
       ...logBase,
       durationMs: Date.now() - t0,
-      details: { sizeMb: Number(mb(size)), captioned: wantsCaption, zoomed: wantsZoom ? { ...session.zoom } : null },
+      details: { sizeMb: Number(mb(size)), captioned: wantsCaption },
     });
     await ctx.telegram.deleteMessage(chatId, msgId).catch(() => {});
     sessions.delete(id);
@@ -1488,11 +1272,11 @@ bot.action(/^dl:([a-f0-9]+):(\w+)$/, async (ctx) => {
       status: 'error',
       error: errText(err),
       durationMs: Date.now() - t0,
-      details: { captioned: wantsCaption, zoomed: wantsZoom, captionFailed: Boolean(err.captionFailed) },
+      details: { captioned: wantsCaption, captionFailed: Boolean(err.captionFailed) },
     });
     // Restore the card + buttons so the user can retry another quality right away
     const msg = err.captionFailed
-      ? '❌ <b>Couldn\'t apply your caption/zoom.</b> Try removing it or pick another quality.'
+      ? '❌ <b>Couldn\'t add the caption.</b> Try removing it or pick another quality.'
       : '❌ <b>Download failed.</b> Try another quality.';
     await edit(`${msg}\n\n${session.caption}`, session.markup);
   } finally {
@@ -1521,7 +1305,6 @@ bot.action(/^clip:([a-f0-9]+)$/, async (ctx) => {
     '✂️ <b>Create highlight clips</b>\n' +
     `I\'ll find the best moments using ${how} and cut up to <b>${CLIP_COUNT}</b> clips.\n` +
     (session.overlay ? `📝 Caption on every clip: <i>${escHtml(clip(session.overlay.text, 50))}</i>\n` : '') +
-    (session.zoom ? `🔍 Zoom on every clip: <i>${zoomLabel(session.zoom)}</i>\n` : '') +
     '\n📱 = Vertical 9:16 (TikTok / Reels / Shorts)\n' +
     '🖥 = Original ratio\n\n' +
     '👇 <b>Pick a format and clip length</b>';
@@ -1577,7 +1360,6 @@ bot.action(/^cp:([a-f0-9]+):([vo]):(\d+)$/, async (ctx) => {
   const logBase = { chatId: ctx.chat.id, url: session.url, title: session.title, choice: `${fmt}${len}` };
   let sentCount = 0;
   let captionSkipped = false;
-  let zoomSkipped = false;
 
   try {
     // 1) Download a working copy
@@ -1644,19 +1426,6 @@ bot.action(/^cp:([a-f0-9]+):([vo]):(\d+)$/, async (ctx) => {
       }
     }
 
-    // Zoom needs the source size to scale back after cropping
-    let zoom = null;
-    let srcDim = null;
-    if (session.zoom) {
-      try {
-        srcDim = await probeSize(src);
-        zoom = session.zoom;
-      } catch (e) {
-        console.error('Zoom probe error:', e.message);
-        zoomSkipped = true;
-      }
-    }
-
     // 3 + 4) Cut and send, best clip first
     for (let i = 0; i < windows.length; i++) {
       const w = windows[i];
@@ -1664,7 +1433,7 @@ bot.action(/^cp:([a-f0-9]+):([vo]):(\d+)$/, async (ctx) => {
 
       await edit(`${session.header}\n\n✂️ <b>Cutting clip ${i + 1} of ${windows.length}…</b>\n${bar(3)}  Step 3 of 4`);
       ctx.sendChatAction('upload_video').catch(() => {});
-      await runBin(FFMPEG, buildClipArgs(src, w.start, len, fmt, out, capPng, zoom, srcDim));
+      await runBin(FFMPEG, buildClipArgs(src, w.start, len, fmt, out, capPng));
 
       const size = fs.statSync(out).size;
       if (size > limitBytes) {
@@ -1698,14 +1467,13 @@ bot.action(/^cp:([a-f0-9]+):([vo]):(\d+)$/, async (ctx) => {
     logEvent(ctx.from, 'clips_done', {
       ...logBase,
       durationMs: Date.now() - t0,
-      details: { format: fmt === 'v' ? '9:16' : 'original', seconds: len, clips: sentCount, signal, captioned: Boolean(capPng), zoomed: zoom ? { ...zoom } : null },
+      details: { format: fmt === 'v' ? '9:16' : 'original', seconds: len, clips: sentCount, signal, captioned: Boolean(capPng) },
     });
 
     await ctx.reply(
       `✅ <b>${plural(sentCount, 'clip')} ready!</b>\n\n` +
         'Ranked from best to least hype. Tap a clip → <b>Save</b> to download it.' +
-        (captionSkipped ? '\n\n⚠️ <i>Your caption couldn\'t be added this time.</i>' : '') +
-      (zoomSkipped ? '\n\n⚠️ <i>Your zoom couldn\'t be applied this time.</i>' : ''),
+        (captionSkipped ? '\n\n⚠️ <i>Your caption couldn\'t be added this time.</i>' : ''),
       {
         parse_mode: 'HTML',
         ...Markup.inlineKeyboard([[Markup.button.callback('✂️ Try another length / format', `clip:${id}`)]]),
