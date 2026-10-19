@@ -1,0 +1,20 @@
+services:
+  - type: worker
+    name: video-dl-bot
+    runtime: docker
+    plan: starter
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: PAYSTACK_SECRET_KEY
+        sync: false
+      - key: ADMIN_IDS
+        sync: false
+      - key: FREE_DAILY_LIMIT
+        value: "3"
+      - key: MAX_UPLOAD_MB
+        value: "50"
+      - key: MAX_CONCURRENT
+        value: "2"
