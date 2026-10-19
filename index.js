@@ -6,6 +6,13 @@ const path = require('path');
 const crypto = require('crypto');
 const paywall = require('./paywall');
 
+require('http')
+  .createServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end('ok');
+  })
+  .listen(process.env.PORT || 3000, () => console.log('Health server on', process.env.PORT || 3000));
+
 // Optional: on-video captions (npm i @napi-rs/canvas)
 let canvasLib = null;
 try {
