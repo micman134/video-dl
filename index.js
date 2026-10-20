@@ -82,10 +82,23 @@ if (COOKIES) {
   try {
     const writable = path.join(TMP_DIR, 'yt-cookies.txt');
     fs.copyFileSync(COOKIES, writable);
-    COOKIES = writable;
-    console.log('YouTube cookies loaded.');
+    const first = (fs.readFileSync(writable, 'utf8').split(/\r?\n/)[0] || '').trim();
+    if (!/^# (Netscape )?HTTP Cookie File/.test(first)) {
+      // A malformed file would make yt-dlp fail on every link (TikTok too), so ignore it
+      console.error('Cookies file is empty or not in Netscape format (first line: "' + first.slice(0, 40) + '"). Ignoring it.');
+      COOKIES = '';
+    } else {
+      COOKIES = writable;
+      console.log('YouTube cookies loaded.');
+    }
   } catch (e) {
     console.error('Could not read YTDLP_COOKIES file (' + COOKIES + '):', e.message);
+    try {
+      const dir = path.dirname(COOKIES);
+      console.error('Files in ' + dir + ': ' + (fs.readdirSync(dir).join(', ') || '(empty)'));
+    } catch {
+      console.error('Directory ' + path.dirname(COOKIES) + ' does not exist: no Secret File has been created on this service.');
+    }
     COOKIES = '';
   }
 } else {
