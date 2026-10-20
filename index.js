@@ -950,6 +950,46 @@ bot.help((ctx) => ctx.reply(HOW_TO, { parse_mode: 'HTML', ...startInline() }));
 bot.command('about', (ctx) => ctx.reply(ABOUT, { parse_mode: 'HTML' }));
 bot.command('clips', (ctx) => ctx.reply(CLIPS_HELP, { parse_mode: 'HTML' }));
 
+// Admin only: diagnose YouTube blocking (version, cookies, JS runtime, proxy, live test)
+bot.command('ytcheck', async (ctx) => {
+  if (!isAdmin(ctx.from.id)) return;
+  const url = ctx.message.text.split(/\s+/)[1] || 'https://www.youtube.com/watch?v=jNQXAC9IWRI';
+  await ctx.reply('🔎 Running yt-dlp check…');
+  let ver = '?';
+  try {
+    ver = (await runBin(YTDLP, ['--version'], { timeout: 15000 })).trim();
+  } catch (e) {
+    return ctx.reply('❌ yt-dlp not runnable: ' + clip(String(e.message), 300));
+  }
+  let cookieInfo = 'none';
+  if (COOKIES) {
+    try {
+      const txt = fs.readFileSync(COOKIES, 'utf8');
+      const first = txt.split(/\r?\n/)[0];
+      const yt = txt.split(/\r?\n/).filter((l) => /youtube\.com|google\.com/.test(l) && !l.startsWith('#')).length;
+      cookieInfo = `${yt} youtube/google cookies, header ${/Netscape|HTTP Cookie File/.test(first) ? 'OK' : 'BAD (' + clip(first, 30) + ')'}`;
+    } catch (e) {
+      cookieInfo = 'unreadable: ' + e.message;
+    }
+  }
+  let result;
+  try {
+    const out = await run([...baseArgs(), '--skip-download', '--print', 'title', url], { timeout: 60000 });
+    result = '✅ Works: ' + clip(out.trim(), 80);
+  } catch (e) {
+    result = '❌ ' + clip(String(e.stderr || e.message).trim().split('\n').slice(-3).join(' | '), 600);
+  }
+  await ctx.reply(
+    '🛠 <b>YouTube check</b>\n\n' +
+      `yt-dlp: <code>${escHtml(ver)}</code>\n` +
+      `Cookies: ${escHtml(cookieInfo)}\n` +
+      `JS runtime flag: ${(process.env.YTDLP_JS_RUNTIME || 'node').toLowerCase() === 'off' ? 'off' : 'node'}\n` +
+      `Proxy: ${process.env.YTDLP_PROXY ? 'set' : 'none'}\n\n` +
+      escHtml(result),
+    { parse_mode: 'HTML' }
+  );
+});
+
 // Admin only: usage summary from the activity log
 bot.command('stats', async (ctx) => {
   if (!ADMIN_IDS.includes(ctx.from.id)) return;
