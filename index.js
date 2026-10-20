@@ -27,7 +27,7 @@ const healthServer = http
 // ---------- Config ----------
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const YTDLP = process.env.YTDLP_PATH || 'yt-dlp';
-const COOKIES = process.env.YTDLP_COOKIES || ''; // optional cookies.txt path
+let COOKIES = process.env.YTDLP_COOKIES || ''; // optional cookies.txt path (Render Secret Files are read-only)
 const MAX_UPLOAD_MB = Number(process.env.MAX_UPLOAD_MB || 50); // 50 = standard Bot API limit
 const MAX_DURATION_MIN = Number(process.env.MAX_DURATION_MIN || 60);
 const MAX_CONCURRENT = Number(process.env.MAX_CONCURRENT || 2);
@@ -75,6 +75,22 @@ if (!BOT_TOKEN) {
   process.exit(1);
 }
 fs.mkdirSync(TMP_DIR, { recursive: true });
+
+// yt-dlp rewrites its cookie file on exit, which fails on read-only paths like /etc/secrets.
+// Work on a writable copy instead.
+if (COOKIES) {
+  try {
+    const writable = path.join(TMP_DIR, 'yt-cookies.txt');
+    fs.copyFileSync(COOKIES, writable);
+    COOKIES = writable;
+    console.log('YouTube cookies loaded.');
+  } catch (e) {
+    console.error('Could not read YTDLP_COOKIES file (' + COOKIES + '):', e.message);
+    COOKIES = '';
+  }
+} else {
+  console.warn('⚠️  YTDLP_COOKIES not set: YouTube will likely block this server ("Sign in to confirm you\'re not a bot").');
+}
 
 const bot = new Telegraf(BOT_TOKEN, { handlerTimeout: 30 * 60 * 1000 });
 
