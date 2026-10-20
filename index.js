@@ -34,6 +34,12 @@ const MAX_CONCURRENT = Number(process.env.MAX_CONCURRENT || 2);
 const TMP_DIR = path.join(__dirname, 'tmp');
 const DATABASE_URL = process.env.DATABASE_URL || '';
 
+// Free-tier feature limits (admins and premium users are exempt)
+const FREE_CLIP_LIMIT = Number(process.env.FREE_CLIP_LIMIT || 1); // free clip jobs
+const FREE_CAPTION_LIMIT = Number(process.env.FREE_CAPTION_LIMIT || 1); // free "Set text" caption uses
+const FREE_FEATURE_WINDOW = (process.env.FREE_FEATURE_WINDOW || 'lifetime').toLowerCase(); // 'lifetime' | 'daily'
+const FREE_WINDOW_TEXT = FREE_FEATURE_WINDOW === 'daily' ? 'per day' : 'in total';
+
 const ADMIN_IDS = (process.env.ADMIN_IDS || '')
   .split(',')
   .map((s) => s.trim())
@@ -120,6 +126,14 @@ async function initDb() {
         error TEXT,
         details JSONB
       )`);
+    await p.query(`
+      CREATE TABLE IF NOT EXISTS dl_feature_usage (
+        user_id BIGINT NOT NULL,
+        feature TEXT NOT NULL,
+        period TEXT NOT NULL,
+        used INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (user_id, feature, period)
+      )`);
     await p.query('CREATE INDEX IF NOT EXISTS dl_activity_user_idx ON dl_activity_log (user_id, created_at DESC)');
     await p.query('CREATE INDEX IF NOT EXISTS dl_activity_event_idx ON dl_activity_log (event, created_at DESC)');
   } catch (e) {
@@ -185,6 +199,107 @@ async function getStats() {
            left(coalesce(title, url, ''), 28) AS what
     FROM dl_activity_log ORDER BY id DESC LIMIT 8`);
   return { s: rows[0], recent: recent.rows };
+}
+
+// ---------- Free-tier feature limits (clips, captions) ----------
+const isAdmin = (id) => ADMIN_IDS.includes(id);
+const memFeatureUsage = new Map(); // fallback when PostgreSQL is not available (resets on restart)
+let premiumDetectWarned = false;
+
+const featurePeriod = () => (FREE_FEATURE_WINDOW === 'daily' ? new Date().toISOString().slice(0, 10) : 'all');
+
+// Admins always pass, so they never hit the paywall's daily limit either
+async function getAccess(userId) {
+  if (isAdmin(userId)) return { allowed: true, admin: true };
+  return paywall.checkAccess(userId);
+}
+
+// Works with several common shapes of paywall module; adjust here if yours differs
+async function isPremiumUser(userId, access) {
+  for (const fn of ['isPremium', 'isSubscribed', 'hasPremium', 'hasActiveSubscription']) {
+    if (typeof paywall[fn] === 'function') {
+      try {
+        return Boolean(await paywall[fn](userId));
+      } catch (e) {
+        console.error('Premium check error:', e.message);
+      }
+    }
+  }
+  if (access && typeof access === 'object') {
+    for (const k of ['premium', 'isPremium', 'subscribed', 'isSubscribed', 'unlimited', 'paid']) {
+      if (k in access) return Boolean(access[k]);
+    }
+    if (typeof access.plan === 'string') return access.plan.toLowerCase() !== 'free';
+  }
+  if (!premiumDetectWarned) {
+    premiumDetectWarned = true;
+    console.warn('⚠️  Could not detect premium status from ./paywall; every non-admin user is treated as free for clips/captions.');
+  }
+  return false;
+}
+
+async function getFeatureUsed(userId, feature) {
+  const period = featurePeriod();
+  if (pool) {
+    try {
+      const r = await pool.query('SELECT used FROM dl_feature_usage WHERE user_id=$1 AND feature=$2 AND period=$3', [userId, feature, period]);
+      return r.rows[0] ? Number(r.rows[0].used) : 0;
+    } catch (e) {
+      console.error('Feature usage read error:', e.message);
+    }
+  }
+  return memFeatureUsage.get(`${userId}:${feature}:${period}`) || 0;
+}
+
+async function bumpFeatureUsed(userId, feature) {
+  const period = featurePeriod();
+  const key = `${userId}:${feature}:${period}`;
+  memFeatureUsage.set(key, (memFeatureUsage.get(key) || 0) + 1);
+  if (!pool) return;
+  try {
+    await pool.query(
+      `INSERT INTO dl_feature_usage (user_id, feature, period, used) VALUES ($1,$2,$3,1)
+       ON CONFLICT (user_id, feature, period) DO UPDATE SET used = dl_feature_usage.used + 1`,
+      [userId, feature, period]
+    );
+  } catch (e) {
+    console.error('Feature usage write error:', e.message);
+  }
+}
+
+// -> { allowed, exempt, left, limit }. exempt = admin or premium (nothing is counted for them)
+async function featureGate(userId, feature, limit, access) {
+  if (isAdmin(userId)) return { allowed: true, exempt: true };
+  if (await isPremiumUser(userId, access)) return { allowed: true, exempt: true };
+  const used = await getFeatureUsed(userId, feature);
+  const left = Math.max(0, limit - used);
+  return { allowed: left > 0, exempt: false, left, limit };
+}
+
+const FEATURE_LABEL = { clip: ['clip job', 'clip jobs', '✂️'], caption: ['caption', 'captions', '📝'] };
+function featureLimitText(feature, limit) {
+  const [one, many, icon] = FEATURE_LABEL[feature];
+  return (
+    `🔒 <b>Free ${one} limit reached</b>\n\n` +
+    `${icon} Free users get <b>${limit}</b> ${limit === 1 ? one : many} ${FREE_WINDOW_TEXT}. ` +
+    'Upgrade to <b>Premium</b> to keep using it without limits.\n\n👇 Tap <b>Plans</b> to upgrade.'
+  );
+}
+function featureLeftLine(feature, gate) {
+  if (gate.exempt) return '';
+  const [one, many] = FEATURE_LABEL[feature];
+  return `🆓 Free ${many} left: <b>${gate.left}/${gate.limit}</b>\n`;
+}
+
+// Used by caption menu buttons. Returns true when the user was blocked.
+async function denyCaptionIfLocked(ctx) {
+  const access = await getAccess(ctx.from.id).catch(() => null);
+  const gate = await featureGate(ctx.from.id, 'caption', FREE_CAPTION_LIMIT, access);
+  if (gate.allowed) return false;
+  logEvent(ctx.from, 'limit_reached', { chatId: ctx.chat.id, details: { action: 'caption' } });
+  await ctx.answerCbQuery('Free caption limit reached.');
+  await ctx.reply(featureLimitText('caption', FREE_CAPTION_LIMIT), { parse_mode: 'HTML', ...paywall.plansKeyboard() });
+  return true;
 }
 
 // ---------- Menu labels ----------
@@ -765,8 +880,8 @@ const WELCOME = () =>
   'Paste a <b>YouTube</b> or <b>TikTok</b> link and I\'ll show you a preview with the available qualities.\n\n' +
   '✂️ <b>Clips:</b> on longer videos I can auto-cut the best moments into ready-to-post clips.\n' +
   '📝 <b>Captions:</b> add your own text + emojis on top of the video.\n\n' +
-  `🆓 <b>Free plan:</b> ${paywall.FREE_DAILY_LIMIT} downloads per day\n` +
-  '💎 <b>Premium:</b> unlimited downloads\n\n' +
+  `🆓 <b>Free plan:</b> ${paywall.FREE_DAILY_LIMIT} downloads per day, ${FREE_CLIP_LIMIT} clip job and ${FREE_CAPTION_LIMIT} caption ${FREE_WINDOW_TEXT}\n` +
+  '💎 <b>Premium:</b> unlimited downloads, clips and captions\n\n' +
   '<i>Only download content you have the right to save.</i>';
 
 const HOW_TO =
@@ -786,7 +901,7 @@ const CLIPS_HELP =
   '4️⃣ Choose <b>📱 Vertical 9:16</b> (TikTok / Reels / Shorts) or <b>🖥 Original</b>, and a length\n' +
   `5️⃣ I find the best moments and send up to <b>${CLIP_COUNT}</b> clips, ranked from best to least hype\n\n` +
   'Tap any clip → <b>Save</b> to download it.\n' +
-  `<i>Works on videos longer than ${Math.round((CLIP_MIN_VIDEO_SEC / 60) * 10) / 10} min. Uses 1 download from your daily limit.</i>`;
+  `<i>Works on videos longer than ${Math.round((CLIP_MIN_VIDEO_SEC / 60) * 10) / 10} min. Uses 1 download from your daily limit. Free users get ${FREE_CLIP_LIMIT} clip job ${FREE_WINDOW_TEXT}.</i>`;
 
 const ABOUT =
   'ℹ️ <b>About this bot</b>\n\n' +
@@ -1042,6 +1157,7 @@ bot.action(/^back:([a-f0-9]+)$/, async (ctx) => {
 bot.action(/^cap:([a-f0-9]+)$/, async (ctx) => {
   const s = await getOwnedSession(ctx, ctx.match[1]);
   if (!s) return;
+  if (await denyCaptionIfLocked(ctx)) return;
   await ctx.answerCbQuery();
   s.expires = Date.now() + 30 * 60 * 1000;
   const m = captionMenu(s);
@@ -1051,6 +1167,7 @@ bot.action(/^cap:([a-f0-9]+)$/, async (ctx) => {
 bot.action(/^capset:([a-f0-9]+)$/, async (ctx) => {
   const s = await getOwnedSession(ctx, ctx.match[1]);
   if (!s) return;
+  if (await denyCaptionIfLocked(ctx)) return;
   await ctx.answerCbQuery();
   s.expires = Date.now() + 30 * 60 * 1000;
   const msg = ctx.callbackQuery.message;
@@ -1122,12 +1239,26 @@ bot.action(/^dl:([a-f0-9]+):(\w+)$/, async (ctx) => {
     return ctx.answerCbQuery('Server is busy. Try again in a minute.', { show_alert: true });
   }
 
-  // Paywall: free users get a daily limit, premium users are unlimited
-  const access = await paywall.checkAccess(ctx.from.id);
+  // Paywall: free users get a daily limit, premium users are unlimited, admins are always free
+  const access = await getAccess(ctx.from.id);
   if (!access.allowed) {
     logEvent(ctx.from, 'limit_reached', { chatId: ctx.chat.id, url: session.url, details: { action: 'download' } });
     await ctx.answerCbQuery('Daily free limit reached.');
     return ctx.reply(paywall.limitText(access), paywall.plansKeyboard());
+  }
+
+  // Caption (Set text) is limited for free users: drop it if they have used up their free captions
+  let captionGate = { allowed: true, exempt: true };
+  if (session.overlay && choice !== 'audio') {
+    captionGate = await featureGate(ctx.from.id, 'caption', FREE_CAPTION_LIMIT, access);
+    if (!captionGate.allowed) {
+      session.overlay = null;
+      logEvent(ctx.from, 'limit_reached', { chatId: ctx.chat.id, url: session.url, details: { action: 'caption' } });
+      await ctx.reply(
+        featureLimitText('caption', FREE_CAPTION_LIMIT) + '\n\n<i>Your video will be sent without the caption.</i>',
+        { parse_mode: 'HTML', ...paywall.plansKeyboard() }
+      );
+    }
   }
 
   await ctx.answerCbQuery('Starting...');
@@ -1267,7 +1398,10 @@ bot.action(/^dl:([a-f0-9]+):(\w+)$/, async (ctx) => {
         }
       );
     }
-    await paywall.recordDownload(ctx.from.id).catch((e) => console.error('Usage record error:', e.message));
+    if (!isAdmin(ctx.from.id)) {
+      await paywall.recordDownload(ctx.from.id).catch((e) => console.error('Usage record error:', e.message));
+    }
+    if (wantsCaption && !captionGate.exempt) await bumpFeatureUsed(ctx.from.id, 'caption');
     logEvent(ctx.from, 'download_done', {
       ...logBase,
       durationMs: Date.now() - t0,
@@ -1310,9 +1444,12 @@ bot.action(/^clip:([a-f0-9]+)$/, async (ctx) => {
   const how = session.heatmap
     ? 'YouTube\'s “Most replayed” data + audio energy'
     : 'audio energy (loudest, most active moments)';
+  const clipAccess = await getAccess(ctx.from.id).catch(() => null);
+  const clipMenuGate = await featureGate(ctx.from.id, 'clip', FREE_CLIP_LIMIT, clipAccess);
   const text =
     `${session.header}\n\n` +
     '✂️ <b>Create highlight clips</b>\n' +
+    featureLeftLine('clip', clipMenuGate) +
     `I\'ll find the best moments using ${how} and cut up to <b>${CLIP_COUNT}</b> clips.\n` +
     (session.overlay ? `📝 Caption on every clip: <i>${escHtml(clip(session.overlay.text, 50))}</i>\n` : '') +
     '\n📱 = Vertical 9:16 (TikTok / Reels / Shorts)\n' +
@@ -1348,12 +1485,33 @@ bot.action(/^cp:([a-f0-9]+):([vo]):(\d+)$/, async (ctx) => {
     return ctx.answerCbQuery('Server is busy. Try again in a minute.', { show_alert: true });
   }
 
-  // Paywall: a clip job uses one download from the daily limit
-  const access = await paywall.checkAccess(ctx.from.id);
+  // Paywall: a clip job uses one download from the daily limit (admins are always free)
+  const access = await getAccess(ctx.from.id);
   if (!access.allowed) {
     logEvent(ctx.from, 'limit_reached', { chatId: ctx.chat.id, url: session.url, details: { action: 'clips' } });
     await ctx.answerCbQuery('Daily free limit reached.');
     return ctx.reply(paywall.limitText(access), paywall.plansKeyboard());
+  }
+
+  // Free users get a limited number of clip jobs before they need a subscription
+  const clipGate = await featureGate(ctx.from.id, 'clip', FREE_CLIP_LIMIT, access);
+  if (!clipGate.allowed) {
+    logEvent(ctx.from, 'limit_reached', { chatId: ctx.chat.id, url: session.url, details: { action: 'clip_feature' } });
+    await ctx.answerCbQuery('Free clip limit reached.');
+    return ctx.reply(featureLimitText('clip', FREE_CLIP_LIMIT), { parse_mode: 'HTML', ...paywall.plansKeyboard() });
+  }
+
+  // Caption on clips is limited too: drop it if the free captions are used up
+  let clipCaptionGate = { allowed: true, exempt: true };
+  if (session.overlay) {
+    clipCaptionGate = await featureGate(ctx.from.id, 'caption', FREE_CAPTION_LIMIT, access);
+    if (!clipCaptionGate.allowed) {
+      session.overlay = null;
+      await ctx.reply(
+        featureLimitText('caption', FREE_CAPTION_LIMIT) + '\n\n<i>Your clips will be made without the caption.</i>',
+        { parse_mode: 'HTML', ...paywall.plansKeyboard() }
+      );
+    }
   }
 
   await ctx.answerCbQuery('Starting clips…');
@@ -1473,7 +1631,11 @@ bot.action(/^cp:([a-f0-9]+):([vo]):(\d+)$/, async (ctx) => {
 
     if (!sentCount) throw Object.assign(new Error('All clips over size limit'), { code: 'TOO_BIG' });
 
-    await paywall.recordDownload(ctx.from.id).catch((e) => console.error('Usage record error:', e.message));
+    if (!isAdmin(ctx.from.id)) {
+      await paywall.recordDownload(ctx.from.id).catch((e) => console.error('Usage record error:', e.message));
+    }
+    if (!clipGate.exempt) await bumpFeatureUsed(ctx.from.id, 'clip');
+    if (capPng && !clipCaptionGate.exempt) await bumpFeatureUsed(ctx.from.id, 'caption');
     logEvent(ctx.from, 'clips_done', {
       ...logBase,
       durationMs: Date.now() - t0,
