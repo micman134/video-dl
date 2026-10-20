@@ -372,6 +372,14 @@ function extractUrl(text = '') {
 function baseArgs() {
   const args = ['--no-playlist', '--no-warnings', '--no-progress'];
   if (COOKIES) args.push('--cookies', COOKIES);
+  // YouTube needs an external JavaScript runtime; reuse the Node.js that runs this bot (set YTDLP_JS_RUNTIME=off to disable)
+  if ((process.env.YTDLP_JS_RUNTIME || 'node').toLowerCase() !== 'off') {
+    args.push('--js-runtimes', 'node:' + process.execPath);
+  }
+  // Optional: route yt-dlp through a (residential) proxy, e.g. http://user:pass@host:port
+  if (process.env.YTDLP_PROXY) args.push('--proxy', process.env.YTDLP_PROXY);
+  // Optional: raw extractor args, e.g. youtube:player_client=tv_simply,web_safari
+  if (process.env.YTDLP_EXTRACTOR_ARGS) args.push('--extractor-args', process.env.YTDLP_EXTRACTOR_ARGS);
   if (FFMPEG !== 'ffmpeg') args.push('--ffmpeg-location', FFMPEG);
   return args;
 }
