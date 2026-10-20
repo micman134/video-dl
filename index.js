@@ -14,6 +14,16 @@ try {
   /* captions disabled until the package is installed */
 }
 
+// ---------- Health server (Render web services must bind a port) ----------
+const http = require('http');
+const PORT = process.env.PORT || 3000;
+const healthServer = http
+  .createServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end('Video downloader bot is running');
+  })
+  .listen(PORT, '0.0.0.0', () => console.log('Health server listening on port ' + PORT));
+
 // ---------- Config ----------
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const YTDLP = process.env.YTDLP_PATH || 'yt-dlp';
@@ -1522,25 +1532,65 @@ async function setupMenu() {
   }
 }
 
-paywall
-  .init()
-  .then(async () => {
-    await initDb().catch((e) => console.error('DB init failed, activity logging disabled:', e.message));
-    await setupMenu();
-    if (!(await hasFfmpeg())) {
-      console.warn(
-        '⚠️  ffmpeg not found (' + FFMPEG + '). Clips, captions, MP3 and HD merging need it. ' +
-          'Install it (apt install ffmpeg) or run: npm i ffmpeg-static ffprobe-static'
-      );
-    }
-    if (!canvasLib) {
-      console.warn('⚠️  Captions are disabled. Run: npm i @napi-rs/canvas');
-    }
-    return bot.launch(() => console.log('Video downloader bot running...'));
-  })
-  .catch((err) => {
-    console.error('Startup error:', err);
+async function start() {
+  try {
+    await paywall.init();
+  } catch (err) {
+    console.error('Paywall init error:', err);
     process.exit(1);
-  });
-process.once('SIGINT', () => bot.stop('SIGINT'));
-process.once('SIGTERM', () => bot.stop('SIGTERM'));
+  }
+
+  await initDb().catch((e) => console.error('DB init failed, activity logging disabled:', e.message));
+  await setupMenu();
+
+  if (!(await hasFfmpeg())) {
+    console.warn(
+      '⚠️  ffmpeg not found (' + FFMPEG + '). Clips, captions, MP3 and HD merging need it. ' +
+        'Install it (apt install ffmpeg) or run: npm i ffmpeg-static ffprobe-static'
+    );
+  }
+  if (!canvasLib) {
+    console.warn('⚠️  Captions are disabled. Run: npm i @napi-rs/canvas');
+  }
+
+  const MAX_RETRIES = Number(process.env.LAUNCH_RETRIES || 12);
+  const RETRY_DELAY_MS = Number(process.env.LAUNCH_RETRY_DELAY_MS || 10000);
+
+  for (let attempt = 1; ; attempt++) {
+    try {
+      // Resolves only when the bot is stopped; throws if polling fails.
+      await bot.launch(() => console.log('Video downloader bot running...'));
+      return;
+    } catch (err) {
+      const is409 = err && err.response && err.response.error_code === 409;
+      if (is409 && attempt <= MAX_RETRIES) {
+        console.warn(
+          `409 Conflict: another instance is still polling this token. Retry ${attempt}/${MAX_RETRIES} in ${RETRY_DELAY_MS / 1000}s...`
+        );
+        try {
+          bot.stop('retry');
+        } catch {
+          /* bot was not running */
+        }
+        await new Promise((r) => setTimeout(r, RETRY_DELAY_MS));
+        continue;
+      }
+      console.error('Startup error:', err);
+      process.exit(1);
+    }
+  }
+}
+
+start();
+
+function shutdown(signal) {
+  try {
+    bot.stop(signal);
+  } catch {
+    /* not running */
+  }
+  healthServer.close(() => process.exit(0));
+  setTimeout(() => process.exit(0), 3000).unref();
+}
+process.once('SIGINT', () => shutdown('SIGINT'));
+process.once('SIGTERM', () => shutdown('SIGTERM'));
