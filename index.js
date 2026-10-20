@@ -81,15 +81,21 @@ fs.mkdirSync(TMP_DIR, { recursive: true });
 if (COOKIES) {
   try {
     const writable = path.join(TMP_DIR, 'yt-cookies.txt');
-    fs.copyFileSync(COOKIES, writable);
-    const first = (fs.readFileSync(writable, 'utf8').split(/\r?\n/)[0] || '').trim();
-    if (!/^# (Netscape )?HTTP Cookie File/.test(first)) {
+    // Normalise: strip BOM/leading blank lines (a common paste problem) and use LF newlines
+    const raw = fs.readFileSync(COOKIES, 'utf8');
+    const text = raw.replace(/^\uFEFF/, '').replace(/\r\n?/g, '\n').replace(/^\s+/, '');
+    const first = text.split('\n')[0].trim();
+    const cookieLines = text.split('\n').filter((l) => l.split('\t').length >= 7).length // includes #HttpOnly_ lines;
+    if (!/^# (Netscape )?HTTP Cookie File/.test(first) || cookieLines === 0) {
       // A malformed file would make yt-dlp fail on every link (TikTok too), so ignore it
-      console.error('Cookies file is empty or not in Netscape format (first line: "' + first.slice(0, 40) + '"). Ignoring it.');
+      console.error(
+        `Cookies file unusable: ${raw.length} bytes, first line "${first.slice(0, 40)}", ${cookieLines} cookie lines (needs "# Netscape HTTP Cookie File" header and tab-separated cookie lines). Ignoring it.`
+      );
       COOKIES = '';
     } else {
+      fs.writeFileSync(writable, text.endsWith('\n') ? text : text + '\n');
       COOKIES = writable;
-      console.log('YouTube cookies loaded.');
+      console.log(`YouTube cookies loaded (${cookieLines} cookie lines).`);
     }
   } catch (e) {
     console.error('Could not read YTDLP_COOKIES file (' + COOKIES + '):', e.message);
@@ -979,7 +985,7 @@ bot.command('ytcheck', async (ctx) => {
     try {
       const txt = fs.readFileSync(COOKIES, 'utf8');
       const first = txt.split(/\r?\n/)[0];
-      const yt = txt.split(/\r?\n/).filter((l) => /youtube\.com|google\.com/.test(l) && !l.startsWith('#')).length;
+      const yt = txt.split(/\r?\n/).filter((l) => /youtube\.com|google\.com/.test(l) && l.split('\t').length >= 7).length;
       cookieInfo = `${yt} youtube/google cookies, header ${/Netscape|HTTP Cookie File/.test(first) ? 'OK' : 'BAD (' + clip(first, 30) + ')'}`;
     } catch (e) {
       cookieInfo = 'unreadable: ' + e.message;
