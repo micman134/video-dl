@@ -992,11 +992,15 @@ bot.command('ytcheck', async (ctx) => {
     }
   }
   let result;
+  let verboseTail = '';
   try {
-    const out = await run([...baseArgs(), '--skip-download', '--print', 'title', url], { timeout: 60000 });
+    const out = await run([...baseArgs(), '--verbose', '--skip-download', '--print', 'title', url], { timeout: 60000 });
     result = '✅ Works: ' + clip(out.trim(), 80);
   } catch (e) {
-    result = '❌ ' + clip(String(e.stderr || e.message).trim().split('\n').slice(-3).join(' | '), 600);
+    const lines = String(e.stderr || e.message).trim().split('\n');
+    result = '❌ ' + clip(lines.slice(-3).join(' | '), 600);
+    // Verbose tail shows which player clients ran and what each one said
+    verboseTail = lines.filter((l) => /\[youtube\]|WARNING|ERROR|js runtime|challenge|cookies|client/i.test(l)).slice(-14).join('\n');
   }
   await ctx.reply(
     '🛠 <b>YouTube check</b>\n\n' +
@@ -1007,6 +1011,7 @@ bot.command('ytcheck', async (ctx) => {
       escHtml(result),
     { parse_mode: 'HTML' }
   );
+  if (verboseTail) await ctx.reply('Verbose tail:\n' + clip(verboseTail, 3500)).catch(() => {});
 });
 
 // Admin only: usage summary from the activity log
